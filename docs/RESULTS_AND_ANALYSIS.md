@@ -24,8 +24,8 @@ F5 参考位于外挂素材目录的 `$study/artifacts/serving_baseline_v1/`，�
 
 - F1 检查逐步 latent、velocity 和最终 PNG 的一致性，同时检查 KV 地址区间、对象身份及按步交错。F2 要求三对通过，且使用相同设备、源码、执行路径和冻结输入。
 - F2 确认 `full` 的串行和并发以相同配对与重复比较。dense true-batch 通过实际 Transformer batch 维度验收。standard sparse 并发的不可用路径以 `UNSUPPORTED` 收据记录。
-- 吞吐按请求数除以同步批次墙钟计算。同一输入配对和重复的并发吞吐比等于串行墙钟除以并发墙钟。每组先汇总重复，再以三个配对为单位做 5,000 次 percentile bootstrap，随机种子为 110。
-- 单请求延迟读取端到端墙钟和设备事件，稀疏步与 kernel 时间用于解释。三例校准数据用于可行性决策，正式尾延迟需更大样本。
+- 吞吐按完成请求数除以同步批次墙钟计算，主表报 images/min。JSON 同时保留 images/s 和摊销 s/image。同一输入配对和重复的并发吞吐比等于串行墙钟除以并发墙钟。每组先汇总重复，再以三个配对为单位做 5,000 次 percentile bootstrap，随机种子为 110。
+- 请求延迟统一从本地批次开始计至各请求完成。串行后续请求包含批内等待。设备事件、稀疏步与 kernel 时间用于解释。三例校准数据用于可行性决策，正式尾延迟需更大样本。
 - F3 分别读取 allocated 与 reserved 的预测误差。固定 N 验收需要成功实测点，目标相对误差 ≤5%。最大 N 单独核对最后成功点和首个真实 OOM。扫描达到上限时只能确认下界。
 
 | F2 判定 | 规则 |
@@ -36,11 +36,11 @@ F5 参考位于外挂素材目录的 `$study/artifacts/serving_baseline_v1/`，�
 | `REPEAT_REQUIRED` | 首两次重复后区间跨 1.05× 或结果为 WEAK，入口加跑两次顺序平衡重复 |
 | `BLOCKED` / `INCOMPLETE` | 查看缺失的阶段、原始收据或对照。判定字段此时是空值 |
 
-Phase B 需在 F2 为 GO 后由作者审阅再启动。
+Phase B 需在 F2 为 GO 后由作者审阅再启动。 [论文指标对齐](METRIC_ALIGNMENT.md)
 
 ## 对回传目录重新分析
 
-在同一 Bash 会话内设置仓库路径和冻结 Python，将 `run` 指向解包的实际运行目录，`analysis` 指向新的输出目录。分析命令读取磁盘证据，可以在无需占用 GPU 的机器运行。F2 分析器会按 SHA-256 重新定位 F1 收据，并核对原始串行和并发 PNG。
+在同一 Bash 会话内设置仓库路径和冻结 Python，将 `run` 指向解包的实际运行目录，`analysis` 指向新的输出目录。分析命令读取磁盘证据，可以在无需占用 GPU 的机器运行。切换到新版分析脚本后可直接重算已有的原始批次收据。F2 分析器会按 SHA-256 重新定位 F1 收据，并核对原始串行和并发 PNG。
 
 ```bash
 exp=/mnt/sda1/experiments

@@ -151,3 +151,27 @@ def test_throughput_summary_closes_with_a_throughput_decision(tmp_path):
     assert summary["status"] == "COMPLETE"
     assert summary["decision"] == "GO"
     assert summary["phases"]["F3"]["status"] == summary["phases"]["F4"]["status"] == "NOT_REQUESTED"
+
+
+def test_frozen_asset_verification_survives_a_git_script_update(tmp_path):
+    from hashlib import sha256
+    from package_h200 import MANIFEST, STUDY_REL, verify_extracted
+
+    runner = STUDY_REL / "scripts/analyze_concurrency.py"
+    protocol = STUDY_REL / "protocol.json"
+    for relative, data in [(runner, "new script"), (protocol, "frozen")]:
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(data)
+    manifest = {"files": {
+        runner.as_posix(): sha256(b"original script").hexdigest(),
+        protocol.as_posix(): sha256(b"frozen").hexdigest(),
+    }}
+    (tmp_path / MANIFEST).write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="analyze_concurrency"):
+        verify_extracted(tmp_path)
+    checked = verify_extracted(tmp_path, assets_and_runtime=True)
+    assert checked["files"] == {protocol.as_posix(): sha256(b"frozen").hexdigest()}
+    (tmp_path / protocol).write_text("changed")
+    with pytest.raises(ValueError, match="protocol.json"):
+        verify_extracted(tmp_path, assets_and_runtime=True)

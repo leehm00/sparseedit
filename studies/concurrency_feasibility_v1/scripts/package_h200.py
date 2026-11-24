@@ -125,13 +125,19 @@ def verify_archive(path):
     return manifest
 
 
-def verify_extracted(root):
+def verify_extracted(root, *, assets_and_runtime=False):
     manifest = json.loads((root / MANIFEST).read_text())
+    git_managed = tuple(STUDY_REL / folder for folder in ("scripts", "tests")) if assets_and_runtime else ()
+    verified = {}
     for relative, expected in manifest["files"].items():
-        path = root / transfer_member(relative)
+        member = transfer_member(relative)
+        if any(member.is_relative_to(directory) for directory in git_managed):
+            continue
+        path = root / member
         if path.is_symlink() or not path.resolve().is_relative_to(root.resolve()) or digest(path) != expected:
             raise ValueError(f"Transfer file differs from SHA-256 manifest: {relative}")
-    return manifest
+        verified[relative] = expected
+    return {**manifest, "files": verified}
 
 
 def main():
@@ -145,6 +151,8 @@ def main():
     checked.add_argument("archive", type=Path)
     extracted = commands.add_parser("verify-extracted")
     extracted.add_argument("root", type=Path)
+    extracted.add_argument("--assets-and-runtime", action="store_true",
+                           help="Verify frozen files, leaving Git-managed scripts and tests to the checked-out revision")
     args = parser.parse_args()
     if args.command == "build":
         manifest = package(args.output, args.plan, args.runbook)
@@ -153,7 +161,7 @@ def main():
         manifest = verify_archive(args.archive)
         print(f"PASS {args.archive} {digest(args.archive)}")
     else:
-        manifest = verify_extracted(args.root.resolve())
+        manifest = verify_extracted(args.root.resolve(), assets_and_runtime=args.assets_and_runtime)
     print(f"{len(manifest['files'])} verified transfer files")
 
 

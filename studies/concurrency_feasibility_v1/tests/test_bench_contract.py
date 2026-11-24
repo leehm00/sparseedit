@@ -312,3 +312,32 @@ def test_throughput_summary_skips_image_scoring(tmp_path, monkeypatch):
     result = json.loads((tmp_path / "feasibility_summary.json").read_text())
     assert result["decision"] == "GO"
     assert result["quality"] == {"status": "SKIPPED"}
+
+
+def test_report_separates_completion_latency_from_amortized_seconds():
+    from analyze_concurrency import render_report, summarize_arms
+
+    serial = make_receipt(mode="serial", wall=8.0)
+    serial["cases"][0]["request_seconds"] = 2.0
+    serial["cases"][1]["request_seconds"] = 6.0
+    repeat = make_receipt(mode="serial", repetition=1, wall=12.0)
+    repeat["cases"][0]["request_seconds"] = 4.0
+    repeat["cases"][1]["request_seconds"] = 8.0
+    concurrent = make_receipt(wall=10.0)
+    concurrent["cases"][0]["request_seconds"] = 9.0
+    concurrent["cases"][1]["request_seconds"] = 10.0
+    dense = dict(make_receipt(wall=10.0), arm="dense", mode="true_batch")
+    dense["cases"][0]["request_seconds"] = dense["cases"][1]["request_seconds"] = 9.9
+    rows = summarize_arms([serial, repeat, concurrent, dense])
+    serial_summary = next(row for row in rows if row["mode"] == "serial")
+    assert serial_summary["images_per_second"] == pytest.approx(0.2)
+    assert serial_summary["images_per_minute"] == pytest.approx(12.0)
+    assert serial_summary["amortized_seconds_per_image"] == pytest.approx(5.0)
+    assert serial_summary["latency_mean_seconds"] == pytest.approx(6.5)
+    assert serial_summary["latency_p50_seconds"] == pytest.approx(6.0)
+    assert next(row for row in rows if row["mode"] == "concurrent")["latency_p50_seconds"] == pytest.approx(9.5)
+    assert next(row for row in rows if row["mode"] == "true_batch")["latency_p50_seconds"] == pytest.approx(10.0)
+    report = render_report({
+        "status": "PASS", "arms": rows, "summary_path": "summary.json", "receipt_root": "receipts",
+    })
+    assert "images/min" in report and "摊销（s/image）" in report and "请求延迟" in report

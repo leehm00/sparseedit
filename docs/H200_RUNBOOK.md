@@ -34,7 +34,7 @@ flux_python="$flux_root/envs/flux/bin/python"
 "$flux_python" -c 'import sys; from importlib.metadata import version; print(sys.version.split()[0], *(f"{p}={version(p)}" for p in ("torch", "triton", "vllm")))'
 export PYTHONPATH="$study/source" PYTHONDONTWRITEBYTECODE=1
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
-"$flux_python" "$study/scripts/package_h200.py" verify-extracted "$repo"
+"$flux_python" "$study/scripts/package_h200.py" verify-extracted "$repo" --assets-and-runtime
 "$flux_python" -m pytest "$study/tests" --ignore="$study/tests/test_baseline_contract.py" -q
 ```
 

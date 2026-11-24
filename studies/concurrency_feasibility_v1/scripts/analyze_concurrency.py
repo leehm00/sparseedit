@@ -9,6 +9,7 @@ import json
 import math
 import random
 from collections import defaultdict
+from itertools import accumulate
 from pathlib import Path
 from statistics import mean
 from typing import Any
@@ -148,17 +149,30 @@ def summarize_arms(receipts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     summaries = []
     for (arm, mode, concurrency), rows in sorted(groups.items()):
         batch_wall = sum(row["batch_wall_seconds"] for row in rows)
-        request_seconds = sorted(case["request_seconds"] for row in rows for case in row["cases"])
+        completion_seconds = []
+        for row in rows:
+            times = [case["request_seconds"] for case in row["cases"]]
+            if mode == "serial":
+                # Serial receipts store service intervals in execution order.
+                times = list(accumulate(times))
+            elif mode == "true_batch":
+                times = [row["batch_wall_seconds"]] * len(times)
+            completion_seconds.extend(times)
+        completion_seconds.sort()
+        throughput = len(completion_seconds) / batch_wall
         summaries.append(
             {
                 "arm": arm,
                 "mode": mode,
                 "concurrency": concurrency,
                 "batches": len(rows),
-                "requests": len(request_seconds),
+                "requests": len(completion_seconds),
                 "mean_batch_wall_seconds": batch_wall / len(rows),
-                "images_per_second": len(request_seconds) / batch_wall,
-                "latency_p50_seconds": _percentile(request_seconds, 0.5),
+                "images_per_second": throughput,
+                "images_per_minute": 60 * throughput,
+                "amortized_seconds_per_image": batch_wall / len(completion_seconds),
+                "latency_mean_seconds": mean(completion_seconds),
+                "latency_p50_seconds": _percentile(completion_seconds, 0.5),
                 "peak_allocated_bytes": max(row["peak_allocated_bytes"] for row in rows),
                 "peak_reserved_bytes": max(row["peak_reserved_bytes"] for row in rows),
                 "first_sparse_step_forward_seconds": _optional_mean(
@@ -357,15 +371,20 @@ def render_report(result: dict[str, Any]) -> str:
     if result.get("arms"):
         lines.extend(
             [
-                "| Arm | Mode | N | 批次 | 平均完整批次（s） | images/s | p50（s） | 峰值 reserved（GiB） |",
-                "|---|---|---:|---:|---:|---:|---:|---:|",
+                "吞吐为完成图数除以同步批次墙钟总和。请求延迟从本地批次开始计时，"
+                "串行后续请求包括批内等待，dense true-batch 的输出在批次完成时返回。",
+                "",
+                "| Arm | Mode | N | 批次 | 平均批次（s） | 吞吐（images/min） | 摊销（s/image） | 请求延迟平均 / p50（s） | 峰值 reserved（GiB） |",
+                "|---|---|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
         for row in result["arms"]:
             lines.append(
                 f"| {row['arm']} | {row['mode']} | {row['concurrency']} | {row['batches']} | "
-                f"{row['mean_batch_wall_seconds']:.3f} | {row['images_per_second']:.4f} | "
-                f"{row['latency_p50_seconds']:.3f} | {row['peak_reserved_bytes'] / 2**30:.2f} |"
+                f"{row['mean_batch_wall_seconds']:.3f} | {row['images_per_minute']:.3f} | "
+                f"{row['amortized_seconds_per_image']:.3f} | "
+                f"{row['latency_mean_seconds']:.3f} / {row['latency_p50_seconds']:.3f} | "
+                f"{row['peak_reserved_bytes'] / 2**30:.2f} |"
             )
         lines.append("")
     if result.get("single_request_p50_ratio") is not None:
@@ -471,8 +490,9 @@ def main() -> int:
     valid_receipts = [row for _, row in measured]
     f1 = _read_isolation(args.isolation_root)
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "phase": "F2",
+        "request_latency_boundary": "local batch start to each request completion, including within-batch waiting",
         "status": "BLOCKED",
         "decision": None,
         "f1_receipts": f1,
