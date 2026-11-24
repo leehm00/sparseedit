@@ -54,6 +54,12 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 
 运行时预检绑定源码身份、校准图与轨迹、设备 UUID 以及环境。模型加载、输入 resize、独立 warmup、PNG 写盘和评分单独记录。F2 主指标覆盖编码、去噪、VAE 解码和运行时图像后处理；设备时间用 CUDA events，批次吞吐使用同步后的墙钟。 [执行协议](../studies/concurrency_feasibility_v1/protocol.json)
 
+## 吞吐模式
+
+仓库首页使用 `--throughput-only`。该模式执行 F0 参照复核、单请求逐步等价、F1 隔离和 F2 配对计时。F0、单请求等价和 F1 检查运行时正确性。F2 仍保存 PNG 哈希、显存峰值和 GPU 时间线，图像质量打分、F3 独立容量扫描和 F4 模板探针不在此轮运行范围。回传端可以从保存的 PNG 补充质量分析。
+
+收据标记 `scope=throughput`。完整 Phase A 可使用同一入口的常规模式，将 F3 和 F4 纳入 GPU 实验。以下表格列出完整阶段定义。
+
 ## 执行阶段与接受条件
 
 | 阶段 | 入口与接受条件 |

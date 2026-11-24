@@ -1,6 +1,6 @@
 # SparseEdit H200 可行性实验
 
-本仓库提供 SparseEdit Phase A 的独立运行入口。在单张 NVIDIA H200 上，用三例冻结校准输入检查 FLUX.1 Kontext Dev 的双请求隔离、完整请求吞吐、显存容量和 CUDA Graph 模板。输出包含原始收据、PNG、GPU 时间线与可重算的汇总报告。
+本仓库提供 SparseEdit 在单张 NVIDIA H200 上的端到端吞吐实验。当前可运行的模型为 FLUX.1 Kontext Dev。运行器先验收两请求隔离，再用三例冻结校准输入测同步批次墙钟、images/s 和每请求 p50。原始收据、PNG 与 GPU 时间线可回传复核。
 
 ## 开始前
 
@@ -9,7 +9,7 @@
 | GPU | 完整 NVIDIA H200，一次运行使用一个物理 GPU UUID |
 | 模型 | **FLUX.1 Kontext Dev**，本地 Diffusers 目录，29 个文件逐一核对 SHA-256 |
 | 冻结环境 | Python **3.12.14**、PyTorch **2.11.0**、Triton **3.6.0**、vLLM **0.26.0**，PyTorch CUDA 13.0 构建 |
-| 校准素材 | `sparseedit_h200_assets.tar.gz` 和 `sparseedit_h200_assets.tar.gz.sha256`，含三张输入、逐例轨迹、F0/F5 参考收据及冻结快照资源 |
+| 校准素材 | `sparseedit_h200_assets_v2.tar.gz` 和 `sparseedit_h200_assets_v2.tar.gz.sha256`，含三张输入、逐例轨迹、F0/F5 参考收据及冻结快照资源 |
 | 结果空间 | 预留约 20 GiB 给日志、PNG、差异快照和 CUDA 时间线 |
 
 校准素材包随实验资料传入内网。模型权重和冻结环境由执行节点准备。模型卡说明权重获取和使用条款，实验按现有模型目录与文件哈希识别版本。 [模型卡](https://huggingface.co/black-forest-labs/FLUX.1-Kontext-dev) · [模型 SHA-256 清单](config/model.sha256) · [环境和模型目录](docs/H200_RUNBOOK.md#冻结模型和环境)
@@ -28,9 +28,9 @@ git clone https://github.com/leehm00/sparseedit.git "$repo"
 cd "$repo"
 (
   cd "$asset_dir"
-  sha256sum -c sparseedit_h200_assets.tar.gz.sha256
+  sha256sum -c sparseedit_h200_assets_v2.tar.gz.sha256
 )
-tar --keep-old-files -xzf "$asset_dir/sparseedit_h200_assets.tar.gz" -C "$repo"
+tar --keep-old-files -xzf "$asset_dir/sparseedit_h200_assets_v2.tar.gz" -C "$repo"
 
 study="$repo/studies/concurrency_feasibility_v1"
 flux_python="$exp/flux_a40_kontext_28step_20260912/envs/flux/bin/python"
@@ -46,10 +46,12 @@ gpu=GPU-REPLACE-WITH-PHYSICAL-UUID
 
 run="$study/artifacts/h200_phase_a_01"
 "$flux_python" -u "$study/scripts/run_h200_phase_a.py" \
-  --gpu-uuid "$gpu" --output-root "$run" --capacity-max 16
+  --gpu-uuid "$gpu" --output-root "$run" --throughput-only
 ```
 
-运行器先复核 F0 和三例单请求等价，再在该 H200 上验证 F1。三对双请求在同一执行路径通过隔离后，运行 F4 模板探针和 F2 性能对照。F3 同时保留预测、实测峰值及准入证据。H200 实测结果由该节点的运行目录生成。 [完整运行手册](docs/H200_RUNBOOK.md)
+吞吐模式保留 F0、单请求等价和 F1 数值隔离作为 F2 的验收门槛。F2 采集 full 串行、并发及 dense 对照，单独记录显存峰值。图像质量评分、独立容量扫描和模板探针在该模式下跳过。 [完整运行手册](docs/H200_RUNBOOK.md)
+
+LongCat-Image-Edit 和 Qwen-Image-Edit 纳入同卡的跨模型吞吐计划。两者各自冻结协议，使用各自的原生或串行基线。多请求路径须完成模型适配与隔离验收后进入计时。 [跨模型吞吐计划](docs/CROSS_MODEL_THROUGHPUT.md)
 
 ## 查看结果及后续分析
 

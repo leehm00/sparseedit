@@ -25,6 +25,7 @@ def test_f1_gate_enables_f2_f4_only_after_pass():
     stages = phase_a_stages("CAPACITY_BLOCKED", "FAILED")
     assert "F2" not in stages and "F4" not in stages
     assert "F3" in stages and "F5" in stages
+    assert phase_a_stages("FAILED", "CAPACITY_BLOCKED", throughput_only=True) == ["F0", "Task2", "F1"]
     stages = phase_a_stages("PASS", "PASS")
     assert stages.index("F4") < stages.index("F2") < stages.index("F3")
 
@@ -93,3 +94,60 @@ def test_f1_watchdog_records_timeout_and_releases_child(tmp_path, monkeypatch):
     assert receipt["status"] == "TIMEOUT"
     assert runner.commands[0]["returncode"] == 124
     assert "10" in (tmp_path / "logs/F1_private_graph.log").read_text()
+
+
+def test_throughput_mode_runs_correctness_and_timing_only(tmp_path, monkeypatch):
+    from run_h200_phase_a import PhaseA
+
+    runner = PhaseA(tmp_path, "GPU-example", 16, throughput_only=True)
+    calls = []
+
+    def invoke(label, script, *arguments, **kwargs):
+        calls.append((label, arguments))
+        if label == "F0":
+            output = tmp_path / "f0_anchor_v1"
+            output.mkdir()
+            (output / "completion.json").write_text('{"status":"PASS"}')
+        if label == "F2_analysis_initial":
+            output = tmp_path / "results"
+            output.mkdir()
+            (output / "feasibility_summary.json").write_text('{"status":"REPEAT_REQUIRED"}')
+        return 0
+
+    def gpu_stage(label, script, output, *arguments, **kwargs):
+        calls.append((label, arguments))
+        return {"status": "PASS"}
+
+    monkeypatch.setattr(runner, "invoke", invoke)
+    monkeypatch.setattr(runner, "gpu_stage", gpu_stage)
+    runner.run()
+    assert [label for label, _ in calls] == [
+        "F0", "Task2", "F1_private_graph", "F2_initial", "F2_analysis_initial",
+        "F2_repeat", "F2_analysis_repeat", "phase_a_summary",
+    ]
+    for label, arguments in calls:
+        if label.startswith("F2_analysis"):
+            assert "--skip-quality-scoring" in arguments
+        if label == "phase_a_summary":
+            assert "--throughput-only" in arguments
+
+
+def test_throughput_summary_closes_with_a_throughput_decision(tmp_path):
+    paths = {}
+    for phase in ("F0", "Task2", "F1", "F2"):
+        path = tmp_path / f"{phase}.json"
+        data = {"status": "PASS"}
+        if phase == "F1":
+            data["pairs"] = []
+            for number in range(3):
+                pair = tmp_path / f"pair-{number}.json"
+                pair.write_text('{"status":"PASS"}')
+                data["pairs"].append({"status": "PASS", "path": pair.name})
+        elif phase == "F2":
+            data["decision"] = "GO"
+        path.write_text(json.dumps(data))
+        paths[phase] = path
+    summary = summarize(paths, tmp_path, throughput_only=True)
+    assert summary["status"] == "COMPLETE"
+    assert summary["decision"] == "GO"
+    assert summary["phases"]["F3"]["status"] == summary["phases"]["F4"]["status"] == "NOT_REQUESTED"

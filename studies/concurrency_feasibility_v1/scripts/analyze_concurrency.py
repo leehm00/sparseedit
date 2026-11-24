@@ -462,6 +462,8 @@ def main() -> int:
     parser.add_argument("--input-root", type=Path, default=STUDY / "artifacts/concurrency_v1")
     parser.add_argument("--results-root", type=Path, default=STUDY / "results")
     parser.add_argument("--isolation-root", type=Path, default=STUDY / "artifacts/isolation_v1")
+    parser.add_argument("--skip-quality-scoring", action="store_true",
+                        help="Verify output hashes and calculate throughput without dense-relative image metrics")
     args = parser.parse_args()
     protocol, identities = load_protocol_cases()
     all_receipts = collect_receipts(args.input_root)
@@ -476,13 +478,16 @@ def main() -> int:
         "f1_receipts": f1,
         "reason": _blocked_reason(f1, valid_receipts),
     }
+    if args.skip_quality_scoring:
+        result["quality"] = {"status": "SKIPPED"}
     try:
         if not valid_receipts:
             raise ValueError(result["reason"])
         _verify_observations(measured, protocol, identities, args.isolation_root)
         result.update(analyze_paired(valid_receipts, protocol, identities))
         result.pop("reason")
-        result["quality"] = _quality_scores(measured)
+        if not args.skip_quality_scoring:
+            result["quality"] = _quality_scores(measured)
         full = next(row for row in valid_receipts if row["arm"] == "full" and row["concurrency"] == 2)
         for row in valid_receipts:
             for field in ("device_uuid", "source_sha", "environment", "timing_boundary"):

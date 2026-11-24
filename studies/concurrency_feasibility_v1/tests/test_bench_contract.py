@@ -282,3 +282,33 @@ def test_analyzer_accepts_moved_f1_receipts_and_detects_changed_outputs(tmp_path
     (f2 / "a.png").write_bytes(b"changed after generating receipt")
     with pytest.raises(ValueError, match="F2 output SHA-256"):
         _verify_observations([(path, record)], PROTOCOL, IDENTITIES, f1)
+
+
+def test_throughput_summary_skips_image_scoring(tmp_path, monkeypatch):
+    import analyze_concurrency as module
+
+    row = dict(make_receipt(), phase="F2")
+    monkeypatch.setattr(module, "collect_receipts", lambda root: [(tmp_path / "measurement", row)])
+    monkeypatch.setattr(
+        module, "load_protocol_cases",
+        lambda: (PROTOCOL, IDENTITIES),
+    )
+    monkeypatch.setattr(module, "_verify_observations", lambda *args: None)
+    monkeypatch.setattr(module, "analyze_paired", lambda *args: {"status": "PASS", "decision": "GO", "paired_repetitions": 2})
+    monkeypatch.setattr(module, "_has_required_controls", lambda *args: True)
+    monkeypatch.setattr(module, "summarize_arms", lambda *args: [])
+    monkeypatch.setattr(module, "sha256_file", lambda path: "a" * 64)
+    monkeypatch.setattr(module, "render_report", lambda result: "")
+
+    def reject_scoring(*args):
+        raise AssertionError("Image scoring should be off")
+
+    monkeypatch.setattr(module, "_quality_scores", reject_scoring)
+    monkeypatch.setattr(sys, "argv", [
+        "analyze_concurrency.py", "--input-root", str(tmp_path),
+        "--isolation-root", str(tmp_path), "--results-root", str(tmp_path), "--skip-quality-scoring",
+    ])
+    assert module.main() == 0
+    result = json.loads((tmp_path / "feasibility_summary.json").read_text())
+    assert result["decision"] == "GO"
+    assert result["quality"] == {"status": "SKIPPED"}

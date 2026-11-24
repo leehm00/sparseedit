@@ -12,7 +12,7 @@ PHASES = ("F0", "Task2", "F1", "F2", "F3", "F4", "F5")
 STATUS_LABELS = {
     "PASS": "通过", "FAIL": "未通过", "FAILED": "失败", "BLOCKED": "受阻",
     "TIMEOUT": "超时", "CAPACITY_BLOCKED": "显存受阻", "PARTIAL": "部分完成", "UNSUPPORTED": "不支持",
-    "UNRUN": "待执行", "INCOMPLETE": "证据不完整", "REPEAT_REQUIRED": "需追加重复",
+    "NOT_REQUESTED": "本轮范围外", "UNRUN": "待执行", "INCOMPLETE": "证据不完整", "REPEAT_REQUIRED": "需追加重复",
 }
 
 
@@ -27,7 +27,7 @@ def evidence_entry(path, root):
     }
 
 
-def summarize(paths, root):
+def summarize(paths, root, *, throughput_only=False):
     rows = {}
     data = {}
     for phase in PHASES:
@@ -77,7 +77,8 @@ def summarize(paths, root):
                 rows["F2"][key] = f2[key]
     else:
         rows["F2"].update(status="BLOCKED", reason="F2 采集要求相同协议的 F1 隔离通过。")
-        rows["F4"].update(status="BLOCKED", reason="模板实验要求 F1 隔离通过。")
+        if not throughput_only:
+            rows["F4"].update(status="BLOCKED", reason="模板实验要求 F1 隔离通过。")
     f3 = data.get("F3", {})
     rows["F3"].update({key: f3[key] for key in ("fixed_n", "maximum_n", "admission") if key in f3})
     f4 = data.get("F4", {})
@@ -89,18 +90,25 @@ def summarize(paths, root):
             {"name": name, **{key: row[key] for key in ("status", "execution_status") if key in row}}
             for name, row in f5["baselines"].items()
         ]
+    required = PHASES
+    if throughput_only:
+        required = ("F0", "Task2", "F1", "F2")
+        for phase in ("F3", "F4"):
+            if phase not in data:
+                rows[phase] = {"status": "NOT_REQUESTED"}
+    complete = decision is not None and all(rows[phase]["status"] in {"PASS", "UNSUPPORTED"} for phase in required)
     return {
         "schema_version": 1, "decision": decision,
-        "status": "COMPLETE" if decision is not None and all(
-            row["status"] in {"PASS", "UNSUPPORTED"} for row in rows.values()
-        ) else "INCOMPLETE",
+        "scope": "throughput" if throughput_only else "phase_a",
+        "status": "COMPLETE" if complete else "INCOMPLETE",
         "phases": rows,
     }
 
 
 def render(summary):
+    title = "SparseEdit H200 吞吐实验状态" if summary.get("scope") == "throughput" else "SparseEdit Phase A 实验状态"
     lines = [
-        "# SparseEdit Phase A 实验状态", "",
+        f"# {title}", "",
         f"F2 判定 **{summary['decision'] or '待定'}**。", "",
         "| 阶段 | 状态 | 收据 |", "|---|---|---|",
     ]
@@ -149,6 +157,7 @@ def main():
     parser.add_argument("--run-root", type=Path)
     parser.add_argument("--results-root", type=Path, required=True)
     parser.add_argument("--receipt", action="append", default=[], metavar="PHASE=PATH")
+    parser.add_argument("--throughput-only", action="store_true", help="Summarize the H200 throughput run scope")
     args = parser.parse_args()
     study = args.study.resolve()
     run = args.run_root or study / "artifacts"
@@ -167,7 +176,11 @@ def main():
             parser.error(f"Expected PHASE=PATH for {item!r}")
         paths[phase] = Path(path)
     args.results_root.mkdir(parents=True, exist_ok=True)
-    summary = summarize(paths, args.results_root)
+    completion = run / "completion.json"
+    throughput_only = args.throughput_only or (
+        args.run_root is not None and completion.is_file() and read_json(completion).get("scope") == "throughput"
+    )
+    summary = summarize(paths, args.results_root, throughput_only=throughput_only)
     (args.results_root / "phase_a_summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
     (args.results_root / "phase_a_report.md").write_text(render(summary))
     print(f"{summary['status']} {args.results_root / 'phase_a_report.md'}")

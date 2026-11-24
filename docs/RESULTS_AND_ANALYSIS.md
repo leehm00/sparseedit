@@ -2,7 +2,7 @@
 
 ## 运行产物
 
-以下路径相对于主命令的 `--output-root`。请从该目录的 `completion.json` 开始，核对设备 UUID、源码树 SHA-256、协议、子命令和退出码，再查对应阶段的原始收据。
+以下路径相对于主命令的 `--output-root`。吞吐模式的汇总标记 `scope=throughput`，独立 F3 和 F4 阶段标记为 `NOT_REQUESTED`。请从该目录的 `completion.json` 开始，核对设备 UUID、源码树 SHA-256、协议、子命令和退出码，再查对应阶段的原始收据。
 
 | 路径 | 内容 |
 |---|---|
@@ -57,7 +57,7 @@ lane=$("$flux_python" -c 'import json,sys; print(json.load(open(sys.argv[1])).ge
 
 "$flux_python" "$study/scripts/analyze_concurrency.py" \
   --input-root "$run/concurrency_v1" --isolation-root "$run/isolation_v1/$lane" \
-  --results-root "$analysis/f2"
+  --results-root "$analysis/f2" --skip-quality-scoring
 
 "$flux_python" "$study/scripts/summarize_phase_a.py" \
   --run-root "$run" --results-root "$analysis" \
@@ -65,7 +65,7 @@ lane=$("$flux_python" -c 'import json,sys; print(json.load(open(sys.argv[1])).ge
   --receipt "F2=$analysis/f2/feasibility_summary.json"
 ```
 
-F2 分析器退出 1 时，仍会生成原因和状态 JSON，随后可单独运行 Phase A 汇总命令。形成 F2 完整判定后，可执行真实收据契约检查。
+F2 分析器退出 1 时，仍会生成原因和状态 JSON，随后可单独运行 Phase A 汇总命令。形成 F2 完整判定后，可执行真实收据契约检查。如果要在回传端补充 Full 相对 Dense 的像素 MSE 和 PSNR，可在新输出目录重跑分析器并省略 `--skip-quality-scoring`。
 
 ```bash
 SPARSEEDIT_VERIFY_F2=1 SPARSEEDIT_F2_ROOT="$run/concurrency_v1" \
