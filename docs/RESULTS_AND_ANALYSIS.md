@@ -1,8 +1,14 @@
 # 结果、统计判定与回传
 
-## 运行产物
+## 窗口汇总
 
-以下路径相对于主命令的 `--output-root`。吞吐模式的汇总标记 `scope=throughput`，独立 F3 和 F4 阶段标记为 `NOT_REQUESTED`。请从该目录的 `completion.json` 开始，核对设备 UUID、源码树 SHA-256、协议、子命令和退出码，再查对应阶段的原始收据。
+`run_h200_window.py` 在窗口目录写入 `report.md`、`completion.json` 与逐项更新的 `session_progress.json`。窗口总表列各阶段状态，并列出已通过验证的吞吐汇总。每项仍有自己的 `completion.json` 和日志。原生基线、探索性 N 扫描、F2 校准与 48 来源正式单请求数据各自分组。
+
+归档整个窗口目录。重新分析 F2 时，把下文的 `run` 指向窗口下的 `flux_f2/`。读取正式 FLUX 单请求表时，打开 `flux_formal_48/formal_summary.json`。 [完整作业清单](H200_EXPERIMENT_MATRIX.md)
+
+## FLUX F2 子目录产物
+
+以下路径相对于窗口下的 `flux_f2/`，也适用于单独执行 FLUX 入口时的 `--output-root`。吞吐模式的汇总标记 `scope=throughput`，独立 F3 和 F4 阶段标记为 `NOT_REQUESTED`。请从该目录的 `completion.json` 开始，核对设备 UUID、源码树 SHA-256、协议、子命令和退出码，再查对应阶段的原始收据。
 
 | 路径 | 内容 |
 |---|---|
@@ -36,7 +42,7 @@ F5 参考位于外挂素材目录的 `$study/artifacts/serving_baseline_v1/`，�
 | `REPEAT_REQUIRED` | 首两次重复后区间跨 1.05× 或结果为 WEAK，入口加跑两次顺序平衡重复 |
 | `BLOCKED` / `INCOMPLETE` | 查看缺失的阶段、原始收据或对照。判定字段此时是空值 |
 
-Phase B 需在 F2 为 GO 后由作者审阅再启动。 [论文指标对齐](METRIC_ALIGNMENT.md)
+F2 只判定其同协议的 FLUX 并发证据。后续投入结合窗口的容量、扩展、正式单请求及跨模型结果判断。 [论文指标对齐](METRIC_ALIGNMENT.md)
 
 ## 对回传目录重新分析
 

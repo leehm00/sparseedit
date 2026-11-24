@@ -138,7 +138,8 @@ class PhaseA:
         lane = "private_graph"
         if anchor["status"] == "PASS":
             task2 = self.gpu_stage("Task2", "run_isolation.py", equivalent,
-                                   "--lane", lane, "--attempt", "1", "--equivalence", *common)
+                                   "--lane", lane, "--attempt", "1", "--equivalence", *common,
+                                   timeout=self.f1_timeout_s)
             if task2["status"] == "PASS":
                 for index, candidate in enumerate(("private_graph", "private_eager"), start=1):
                     lane = candidate

@@ -54,11 +54,13 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 
 运行时预检绑定源码身份、校准图与轨迹、设备 UUID 以及环境。模型加载、输入 resize、独立 warmup、PNG 写盘和评分单独记录。F2 主指标覆盖编码、去噪、VAE 解码和运行时图像后处理；设备时间用 CUDA events，批次吞吐使用同步后的墙钟。 [执行协议](../studies/concurrency_feasibility_v1/protocol.json)
 
-## 吞吐模式
+## 一次窗口的吞吐采集
 
-仓库首页使用 `--throughput-only`。该模式执行 F0 参照复核、单请求逐步等价、F1 隔离和 F2 配对计时。F0、单请求等价和 F1 检查运行时正确性。F2 仍保存 PNG 哈希、显存峰值和 GPU 时间线，图像质量打分、F3 独立容量扫描和 F4 模板探针不在此轮运行范围。回传端可以从保存的 PNG 补充质量分析。
+仓库首页默认运行 `run_h200_window.py`，按窗口清单保留独立作业。它调用 `run_h200_phase_a.py --throughput-only` 执行 FLUX F0、单请求等价、F1 和有隔离依据的 F2，另外调度密集基线、扩展测试、容量和模板探针。这样可以把性能数据和失败定位都带出内网。图像质量评分可在回传端执行。
 
-收据标记 `scope=throughput`。完整 Phase A 可使用同一入口的常规模式，将 F3 和 F4 纳入 GPU 实验。以下表格列出完整阶段定义。
+只重跑指定项时给窗口入口传入 `--stage`，同一选项可重复。每次使用新输出目录。已知分配结束时间时使用 `--budget-minutes`。各阶段的资源或数值状态见相应收据。 [窗口与原计划的对应表](H200_EXPERIMENT_MATRIX.md)
+
+下表定义 FLUX Phase A 的各阶段。单独运行 `run_h200_phase_a.py` 时可选择 `--throughput-only`，把 F3、F4 留给窗口入口。
 
 ## 执行阶段与接受条件
 
@@ -81,7 +83,7 @@ F1 以逐位相同为验收。出现差异时，运行器保存原始张量、�
 | 素材校验失败 | 对照素材包 SHA-256，检查 checkout 与素材包是否配套。选择新的干净目录重新解包。 |
 | Python 或模型校验失败 | 查看资源盘点或阶段日志，按上面的冻结环境和权重路径核对版本及文件 SHA-256。 |
 | 设备非 H200 或已有任务 | 读取 `resource_inventory/completion.json`，选择空闲的完整 H200 UUID。 |
-| F1 不通过或超时 | 保留 `isolation_v1/` 和 `logs/`。定位首个失败阶段，按原协议重新核验。F2 和 F4 等待同设备 F1 通过。 |
+| F1 不通过或超时 | 保留 `isolation_v1/` 和 `logs/`。定位首个失败阶段，按原协议重新核验。以同设备隔离收据解释 F2 和 F4。窗口中的独立阶段继续采集。 |
 | 容量 OOM | 查看 `capacity_v1/` 的首个 OOM 收据与实测峰值。保留原协议和 OOM 记录。 |
 | 主脚本退出 1 | 打开 `completion.json` 及 `results/phase_a_report.md`。已有阶段可能通过，结论由各阶段收据给出。重新执行用新输出目录。 |
 

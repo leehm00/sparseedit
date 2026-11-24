@@ -1,0 +1,193 @@
+{
+  "schema_version": 1,
+  "plan": "2026-11-24-sparseedit-atc2027-experiment-plan",
+  "session_runner": "studies/concurrency_feasibility_v1/scripts/run_h200_window.py",
+  "decision_scope": "Results classify evidence for the tested model and path. Independent jobs continue after another job fails.",
+  "formal_flux_assets": {
+    "archive": "sparseedit_h200_flux_formal_48_v1.tar.gz",
+    "sha256": "1b5b4a52dd4639e9adcc416dd068c896630a165fc49b2e239a8666a0d595911a",
+    "extracted_directory": "sparseedit_h200_flux_formal_48_v1",
+    "sources": {"calibration": 3, "test": 48},
+    "wrapper": "studies/concurrency_feasibility_v1/scripts/bench_flux_formal.py"
+  },
+  "jobs": [
+    {
+      "id": "phase_a_f0_f1_f2",
+      "plan_tasks": [0, 1, 2, 3, 5],
+      "experiments": ["F0", "F1", "F2"],
+      "stages": ["flux_f2"],
+      "status": "scheduled",
+      "coverage": "A40 F0 anchor readback, H200 serial equivalence and request isolation, admitted N=1/2 paired runtime throughput and available baseline arms.",
+      "requirements": ["v2 study assets", "FLUX.1 Kontext Dev", "Local Phase A admission for its own F2 comparison"]
+    },
+    {
+      "id": "phase_a_f3",
+      "plan_tasks": [6],
+      "experiments": ["F3"],
+      "stages": ["flux_capacity"],
+      "status": "scheduled",
+      "coverage": "Allocated and reserved peaks, N scan, admission model and observed capacity boundary at 768px.",
+      "requirements": ["v2 study assets", "FLUX.1 Kontext Dev"]
+    },
+    {
+      "id": "phase_a_f4",
+      "plan_tasks": [4],
+      "experiments": ["F4"],
+      "stages": ["flux_templates"],
+      "status": "scheduled",
+      "coverage": "Request-private eager and graph arms, persistent serial graph reuse, cold and repeat timing, different-K signature isolation checks.",
+      "requirements": ["v2 study assets", "FLUX.1 Kontext Dev", "F1 receipts classify evidence scope; the local serial comparison supports an independent diagnostic run"]
+    },
+    {
+      "id": "phase_a_f5",
+      "plan_tasks": [7],
+      "experiments": ["F5"],
+      "stages": ["flux_native_serving", "flux_dense", "flux_f2"],
+      "status": "scheduled",
+      "coverage": "Native AsyncOmni baseline, dense service control and local paired runtime comparisons. FlashPS mechanism and compatibility are read back from its checked artifact.",
+      "requirements": ["v2 study assets", "FLUX.1 Kontext Dev"]
+    },
+    {
+      "id": "worker_integration",
+      "plan_tasks": [8],
+      "experiments": ["E4"],
+      "stages": ["flux_native_serving"],
+      "status": "implementation_needed",
+      "coverage": "The native worker baseline records actual request scheduling behavior.",
+      "remaining_requirements": [
+        "Connect private executor, scheduler and capacity manager to vLLM-Omni active request set",
+        "Trace actual async worker overlap and isolated outputs",
+        "Exercise shutdown, failure cleanup and queue or serial fallback"
+      ]
+    },
+    {
+      "id": "flux_scaling_768",
+      "plan_tasks": [9, 10],
+      "experiments": ["E4", "E5"],
+      "stages": ["flux_scaling_eager", "flux_scaling_graph", "flux_capacity"],
+      "status": "scheduled",
+      "coverage": "N=1/2/4/8 FLUX 768px calibration scaling with distinct private paths and bounded capacity scan.",
+      "remaining_requirements": [
+        "Freeze a full-source concurrent cohort and collect at least 24 sources with two repetitions for formal p99",
+        "Provide compatible dense and standard sparse multi-request paths for any additional arms"
+      ]
+    },
+    {
+      "id": "flux_dense_1024",
+      "plan_tasks": [9, 10],
+      "experiments": ["E1", "E5", "E6"],
+      "stages": ["flux_dense_1024"],
+      "status": "scheduled",
+      "coverage": "FLUX 1024px native dense calibration timing and memory. Dense configuration probes are separate from the 768px sparse path.",
+      "remaining_requirements": [
+        "Freeze 1024px sparse traces with matching token geometry and scheduler",
+        "Verify 1024px sparse N=1 and a concurrent point with 1024px isolation and capacity"
+      ]
+    },
+    {
+      "id": "flux_formal_48",
+      "plan_tasks": [10],
+      "experiments": ["E1", "E9", "E10"],
+      "stages": ["flux_formal_48"],
+      "status": "asset_optional",
+      "coverage": "FLUX 768px frozen K=460 single-request Direct, calibrated Standard and Full, 48 held-out sources and two repetitions per arm.",
+      "requirements": ["Optional formal FLUX archive and SHA-256 sidecar", "FLUX.1 Kontext Dev files matching frozen model hashes"],
+      "remaining_requirements": [
+        "Collect dense fastops, compile or graph as separate verified arms if implemented",
+        "Align dense reference images and score on a separate machine"
+      ]
+    },
+    {
+      "id": "sensitivity",
+      "plan_tasks": [10],
+      "experiments": ["E6"],
+      "stages": ["flux_dense", "flux_dense_1024", "flux_formal_48"],
+      "status": "assets_needed",
+      "coverage": "Native dense resolution comparison and frozen FLUX sparse 20% point.",
+      "remaining_requirements": [
+        "Freeze source-specific FLUX 10%, 35%, 50% and 1024px masks",
+        "Freeze protocol and regenerate matching traces for any warmup, refresh, CFG or step sensitivity point"
+      ]
+    },
+    {
+      "id": "cross_model",
+      "plan_tasks": [10],
+      "experiments": ["E7"],
+      "stages": ["longcat_dense", "qwen_dense"],
+      "status": "implementation_needed",
+      "coverage": "Independent 1024px native dense LongCat and Qwen baselines on the selected H200 with resident placement.",
+      "remaining_requirements": [
+        "Port or stage each model's verified sparse implementation and its complete matching assets",
+        "Validate Qwen sparse execution with one H200 and no model offload",
+        "Integrate the model-specific private executor and pass request isolation for sparse concurrent variants"
+      ]
+    },
+    {
+      "id": "template_amortization",
+      "plan_tasks": [4, 10],
+      "experiments": ["F4", "E8"],
+      "stages": ["flux_templates", "flux_scaling_eager", "flux_scaling_graph"],
+      "status": "scheduled",
+      "coverage": "First request, repeated-case cache hit, different same-shape cases, misses, capture counts, private eager or graph cost, and structural K signatures.",
+      "remaining_requirements": [
+        "Freeze multiple K traces and control template pool capacity before a full K-by-capacity timing sweep"
+      ]
+    },
+    {
+      "id": "quality",
+      "plan_tasks": [3, 10],
+      "experiments": ["E9"],
+      "stages": ["flux_f2", "flux_formal_48", "longcat_dense", "qwen_dense"],
+      "status": "offline_analysis",
+      "coverage": "GPU stages retain outputs, available latent and velocity witnesses, PNG hashes and numerical admission results. Timed execution excludes metric scoring.",
+      "remaining_requirements": [
+        "Join matched dense and optimized PNGs by model, source, repetition and protocol",
+        "Evaluate LPIPS, PSNR, SSIM and CLIP away from the reserved GPU",
+        "Preserve exact-lane and arithmetic-changing comparisons"
+      ]
+    },
+    {
+      "id": "artifact",
+      "plan_tasks": [0, 10],
+      "experiments": ["E10"],
+      "stages": [],
+      "status": "scheduled",
+      "coverage": "Session command list, per-stage logs and receipts, raw images and available timeline records, artifact hashes, device and environment.",
+      "requirements": ["Preserve original outputs and include complete receipt links when returning the session"]
+    },
+    {
+      "id": "packing_diagnostic",
+      "plan_tasks": [11],
+      "experiments": ["F6", "C4b"],
+      "stages": ["flux_f6_packing"],
+      "status": "scheduled",
+      "coverage": "Synthetic GPU comparison at K=460, hidden=3072, MLP=12288 and N=1/2/4. Runtime packing gains require actual stage profiling and end-to-end validation."
+    },
+    {
+      "id": "step_aware_diagnostic",
+      "plan_tasks": [11],
+      "experiments": ["C4c"],
+      "stages": ["flux_f2", "flux_scaling_eager", "flux_scaling_graph"],
+      "status": "implementation_needed",
+      "coverage": "Existing stage timings and timelines can identify step imbalance.",
+      "remaining_requirements": ["Implement and validate an isolated step-type-aware scheduler comparison if stage imbalance is observed"]
+    },
+    {
+      "id": "external_masks",
+      "plan_tasks": [11],
+      "experiments": ["E11"],
+      "stages": [],
+      "status": "implementation_needed",
+      "coverage": "Frozen FLUX trajectory replay supplies a fixed external mask for the existing protocol.",
+      "remaining_requirements": ["Specify and validate a model-specific external mask adapter across additional policies and boundaries"]
+    },
+    {
+      "id": "kv_offload",
+      "plan_tasks": [11],
+      "experiments": [],
+      "stages": [],
+      "status": "analysis_scope",
+      "coverage": "Discuss active versus queued KV lifetimes using the resident capacity evidence, consistent with the original plan."
+    }
+  ]
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check the selected A40 without opening a CUDA context."""
+"""Check the selected device without opening a CUDA context."""
 
 import argparse
 import csv
@@ -22,6 +22,7 @@ def query(uuid, name, fields):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gpu-uuid", required=True)
+    parser.add_argument("--require-gpu-name", default="NVIDIA A40")
     args = parser.parse_args()
 
     (index, uuid, name, total_mib, free_mib), = query(
@@ -34,8 +35,8 @@ def main():
     ]
     free_bytes = int(free_mib) * 2**20
     reasons = []
-    if uuid != args.gpu_uuid or name != "NVIDIA A40":
-        reasons.append("Selected device differs from the requested A40.")
+    if uuid != args.gpu_uuid or not (name == args.require_gpu_name or name.startswith(args.require_gpu_name + " ")):
+        reasons.append(f"Selected device differs from the requested {args.require_gpu_name}.")
     if free_bytes <= 40 * 2**30:
         reasons.append("F0 requires more than 40 GiB of free GPU memory.")
     if compute_apps:

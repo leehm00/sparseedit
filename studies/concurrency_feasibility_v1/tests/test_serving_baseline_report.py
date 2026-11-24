@@ -93,3 +93,22 @@ def test_native_probe_accepts_a_separate_checkpoint_startup_timeout():
     )
     assert proc.returncode == 2
     assert "Use a physical GPU UUID" in proc.stderr
+
+
+def test_native_probe_can_write_a_h200_session_receipt(tmp_path, monkeypatch):
+    import audit_serving_baseline as audit
+
+    monkeypatch.setattr(audit, "STUDY", tmp_path)
+    (tmp_path / "protocol.json").write_text("{}")
+    output = tmp_path / "artifacts/h200_window_01/flux_native_serving"
+    def run_native(args, root, receipt):
+        assert root == output
+        assert args.verify_full_model_hashes and args.require_gpu_name == "NVIDIA H200"
+        receipt.update(execution_status="SERIAL_BASELINE")
+    monkeypatch.setattr(audit, "run_native", run_native)
+    monkeypatch.setattr(sys, "argv", [
+        "audit_serving_baseline.py", "run-native", "--gpu-uuid", "GPU-test",
+        "--output-root", str(output), "--verify-full-model-hashes", "--require-gpu-name", "NVIDIA H200",
+    ])
+    assert audit.main() == 0
+    assert json.loads((output / "completion.json").read_text())["execution_status"] == "SERIAL_BASELINE"

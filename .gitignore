@@ -28,3 +28,5 @@ __pycache__/
 /studies/concurrency_feasibility_v1/source/vllm_omni/model_executor/models/covo_audio/speaker_prompt/speaker_embed.npy
 /studies/concurrency_feasibility_v1/source/vllm_omni/model_executor/models/step_audio2/assets/default_female.wav
 /studies/concurrency_feasibility_v1/source/vllm_omni/model_executor/models/step_audio2/assets/default_male.wav
+
+/offline_formal/

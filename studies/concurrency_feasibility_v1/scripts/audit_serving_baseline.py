@@ -252,7 +252,12 @@ def run_native(args, output, receipt):
     receipt["bundle_sha256"] = sha256(bundle_file)
     receipt["source_sha256"] = frozen.sha256_payload(bundle["runtime_hashes"])
     receipt["script_sha256"] = sha256(__file__)
-    receipt["model_identity"] = verify_model_identity(bundle["model_hashes"])
+    if args.verify_full_model_hashes:
+        verify_hashes(MODEL, bundle["model_hashes"])
+        receipt["model_identity"] = {"model_path": str(MODEL), "files": len(bundle["model_hashes"]),
+                                     "method": "frozen v4 file checksums"}
+    else:
+        receipt["model_identity"] = verify_model_identity(bundle["model_hashes"])
     cases = load_cases(bundle_root, bundle)[:2]
     receipt["scheduled_cases"] = [
         {
@@ -263,7 +268,8 @@ def run_native(args, output, receipt):
         for case, *_ in cases
     ]
     preflight = subprocess.run(
-        [sys.executable, str(STUDY / "scripts/check_env.py"), "--gpu-uuid", args.gpu_uuid],
+        [sys.executable, str(STUDY / "scripts/check_env.py"), "--gpu-uuid", args.gpu_uuid,
+         "--require-gpu-name", args.require_gpu_name],
         capture_output=True, text=True, check=False,
     )
     receipt["environment"] = json.loads(preflight.stdout)
@@ -353,6 +359,8 @@ def main():
     run.add_argument("--gpu-uuid", required=True)
     run.add_argument("--output-root", required=True, type=Path)
     run.add_argument("--startup-timeout-s", type=int, default=1800)
+    run.add_argument("--require-gpu-name", default="NVIDIA A40")
+    run.add_argument("--verify-full-model-hashes", action="store_true")
     args = parser.parse_args()
     if args.command == "validate":
         validate_baseline_report(load_json(args.report))
@@ -362,8 +370,9 @@ def main():
     if args.startup_timeout_s <= 0:
         parser.error("--startup-timeout-s must be positive.")
     output = args.output_root.resolve()
-    if not output.is_relative_to(REPORT) or output == REPORT:
-        parser.error("Choose a fresh run directory under artifacts/serving_baseline_v1.")
+    artifacts = STUDY / "artifacts"
+    if not output.is_relative_to(artifacts) or output in (artifacts, REPORT):
+        parser.error("Choose a fresh run directory under study artifacts.")
     output.mkdir(parents=True, exist_ok=False)
     receipt = {
         "phase": "F5_native_async_audit",

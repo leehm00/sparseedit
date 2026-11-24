@@ -29,11 +29,12 @@ TIMING = "Synchronized encoding through image postprocessing, excluding PNG writ
 
 def f1_admission(root, expected, protocol, device):
     lanes = {}
+    source_sha = source_tree_sha()
     for path in root.rglob("completion.json"):
         row = load_json(path)
         if row.get("phase") != "F1" or row.get("status") != "PASS" or row.get("device_uuid") != device:
             continue
-        if (row.get("source_sha") != source_tree_sha() or row.get("protocol") != protocol
+        if (row.get("source_sha") != source_sha or row.get("protocol") != protocol
                 or row.get("correctness", {}).get("all_match") is not True or len(row.get("cases", [])) != 2):
             continue
         tags = frozenset(case["case_tag"] for case in row["cases"])
@@ -43,6 +44,15 @@ def f1_admission(root, expected, protocol, device):
         if set(pairs) == expected:
             return {"lane": lane, "pair_receipt_sha256": list(pairs.values())}
     raise ValueError("F4 requires all three F1 PASS pairs for this source, protocol and GPU")
+
+
+def template_admission(root, expected, protocol, device, *, diagnostic_without_f1=False):
+    try:
+        return {"status": "PASS", **f1_admission(root, expected, protocol, device)}
+    except (OSError, ValueError) as error:
+        if not diagnostic_without_f1:
+            raise
+        return {"status": "UNAVAILABLE", "reason": str(error)}
 
 
 def separate_k_signature(k):
@@ -166,6 +176,8 @@ def main():
     parser.add_argument("--isolation-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--verify-full-model-hashes", action="store_true")
+    parser.add_argument("--diagnostic-without-f1", action="store_true",
+                        help="Collect locally verified probe data if the full F1 receipts are unavailable")
     args = parser.parse_args()
     root = args.output_root.resolve()
     if not root.is_relative_to(STUDY / "artifacts"):
@@ -182,9 +194,12 @@ def main():
         versions.update({name: version(name) for name in ("torch", "triton", "vllm")})
         protocol, identities = load_protocol_cases()
         receipt.update(environment=versions, protocol=protocol, cases=list(identities.values()))
-        receipt["f1_gate"] = f1_admission(args.isolation_root, {
+        receipt["f1_gate"] = template_admission(args.isolation_root, {
             frozenset(pair) for pair in calibration_pairs(tuple(identities))
-        }, protocol, args.gpu_uuid)
+        }, protocol, args.gpu_uuid, diagnostic_without_f1=args.diagnostic_without_f1)
+        receipt["evidence_scope"] = (
+            "f1_admitted" if receipt["f1_gate"]["status"] == "PASS" else "diagnostic"
+        )
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_uuid
         os.environ.pop("PYTORCH_ALLOC_CONF", None)
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
