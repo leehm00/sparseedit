@@ -1,0 +1,17 @@
+{
+  "python": "3.12.14",
+  "torch": "2.11.0",
+  "torch_build": "2.11.0+cu130",
+  "torch_cuda": "13.0",
+  "triton": "3.6.0",
+  "vllm": "0.26.0",
+  "diffusers": "0.38.0",
+  "transformers": "5.5.3",
+  "accelerate": "1.12.0",
+  "huggingface-hub": "1.30.0",
+  "flashinfer-python": "0.6.14",
+  "numpy": "2.3.5",
+  "Pillow": "12.3.0",
+  "safetensors": "0.8.0",
+  "pytest": "9.1.1"
+}

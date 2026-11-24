@@ -1,0 +1,61 @@
+{
+  "kind": "sparseedit_concurrency_feasibility",
+  "model": "FLUX.1-Kontext-dev",
+  "height": 768,
+  "width": 768,
+  "dtype": "bfloat16",
+  "steps": 28,
+  "warmup": 8,
+  "refresh": 23,
+  "refresh_interval": 15,
+  "true_cfg_scale": 4.0,
+  "guidance_scale": 1.0,
+  "N": 2304,
+  "reference_tokens": 2304,
+  "K": 460,
+  "sparse_ratio": 0.2,
+  "seed": 110,
+  "batch_size": 1,
+  "velocity_reuse": false,
+  "routing": false,
+  "trace": "v4 frozen per-case fixed-mask trace",
+  "calibration_cases": [
+    {
+      "case_tag": "background_change_e88625bb04f622bf73a13e76e47c405b",
+      "input_filename": "0286b25427eed9c5f39814d57f2cb9090ba8eb97ccabd2070e3fe552fcd089ee.png",
+      "instruction": "Adjust the background to a city.",
+      "source_pixel_sha256": "0286b25427eed9c5f39814d57f2cb9090ba8eb97ccabd2070e3fe552fcd089ee",
+      "prepared_sha256": "da00cf103baffcce6ec58e082261364b11d8df30e515877ff6088ad80d92054e",
+      "trace_sha256": "84792e2f033aa90e8a499d2194fd26540d1f066c6c23a9e2328c61f8abcf733c"
+    },
+    {
+      "case_tag": "color_alter_eeab5f9b2f3a62deb674c7bc6af021fb",
+      "input_filename": "186847ffa0819c35e7562215fcb6fed6832e52803d1ce37d52fe249df568143e.png",
+      "instruction": "Change the car body color to gray.",
+      "source_pixel_sha256": "186847ffa0819c35e7562215fcb6fed6832e52803d1ce37d52fe249df568143e",
+      "prepared_sha256": "6ea9c64c9c0b339dcc6a5c0faedc2f011aa2ac45cf61627e7dff5b8bc42470a6",
+      "trace_sha256": "46bea87e4fa458db38077d0c52eca62bce8e8ed796fd2c48bfec2ea5e343988a"
+    },
+    {
+      "case_tag": "material_alter_a1e647285bd94edb240a412737354b02",
+      "input_filename": "7860de0f2aeb8db2f2afc9c93e981a4477219aa60d30b6da9adf59e137e138c1.png",
+      "instruction": "Construct the elephant from bricks.",
+      "source_pixel_sha256": "7860de0f2aeb8db2f2afc9c93e981a4477219aa60d30b6da9adf59e137e138c1",
+      "prepared_sha256": "311b97d9bceaad497cd57be1e79e77f6750e8fb2735de8cb5abeed207b0e1e85",
+      "trace_sha256": "fd75aea9eead0a997ce30575fe414ab32ad24ba60922e39cdba01b059ab005fe"
+    }
+  ],
+  "calibration_case_sha256": {
+    "background_change_e88625bb04f622bf73a13e76e47c405b": "da00cf103baffcce6ec58e082261364b11d8df30e515877ff6088ad80d92054e",
+    "color_alter_eeab5f9b2f3a62deb674c7bc6af021fb": "6ea9c64c9c0b339dcc6a5c0faedc2f011aa2ac45cf61627e7dff5b8bc42470a6",
+    "material_alter_a1e647285bd94edb240a412737354b02": "311b97d9bceaad497cd57be1e79e77f6750e8fb2735de8cb5abeed207b0e1e85"
+  },
+  "calibration_trace_sha256": {
+    "background_change_e88625bb04f622bf73a13e76e47c405b": "84792e2f033aa90e8a499d2194fd26540d1f066c6c23a9e2328c61f8abcf733c",
+    "color_alter_eeab5f9b2f3a62deb674c7bc6af021fb": "46bea87e4fa458db38077d0c52eca62bce8e8ed796fd2c48bfec2ea5e343988a",
+    "material_alter_a1e647285bd94edb240a412737354b02": "fd75aea9eead0a997ce30575fe414ab32ad24ba60922e39cdba01b059ab005fe"
+  },
+  "v4_bundle_sha256": "e559de093f959c3985faf4ed911d49efb4d10b89da5a4bcf53f1a3fd4563776d",
+  "baseline_source_sha256": "832ce849514c5a377e7867893552843643b859bba9ce05f7a2119b2037cd4165",
+  "baseline_source_file_count": 1255
+}
