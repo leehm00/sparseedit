@@ -1,0 +1,6 @@
+payload_data/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.tar.gz
+*.tar.gz.sha256

@@ -1,0 +1,1047 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+# This implementation is heavily inspired by the diffusers project.
+# Original implementation: https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/flux/pipeline_flux_kontext.py
+
+from __future__ import annotations
+
+import json
+import os
+from contextlib import nullcontext
+from concurrent.futures import ThreadPoolExecutor
+import time
+from collections.abc import Callable, Iterable
+from typing import Any, ClassVar, cast
+
+import numpy as np
+import PIL.Image
+import torch
+import torch.nn as nn
+from diffusers.image_processor import VaeImageProcessor
+from diffusers.loaders import TextualInversionLoaderMixin
+from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
+from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+from diffusers.utils.torch_utils import randn_tensor
+from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
+from vllm.model_executor.models.utils import AutoWeightsLoader
+
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.flux import (
+    FluxKontextTransformer2DModel,
+)
+from vllm_omni.diffusion.models.flux.acceleration import FluxKontextAccelerationConfig
+from vllm_omni.diffusion.models.flux.acceleration_runtime import diffuse_with_flux_kontext_acceleration
+from vllm_omni.diffusion.models.flux.flux_pipeline_mixin import FluxPipelineMixin
+from vllm_omni.diffusion.models.flux.kontext_resolution import (
+    normalize_kontext_reference_latents,
+    resolve_kontext_dimensions,
+    validate_kontext_generated_latents,
+)
+from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
+from .track_a_timing import DeviceLedger
+from .serial_session import PostResponsePrewarm, SourceImageSessionCache, UniversalNegativeBank, session_mode
+
+from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
+from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.logger import init_logger
+
+logger = init_logger(__name__)
+
+
+def get_flux_kontext_post_process_func(od_config: OmniDiffusionConfig) -> Callable:
+    """Get postprocessing function for FLUX.1-Kontext pipeline."""
+    model_name = od_config.model
+    if os.path.exists(model_name):
+        model_path = model_name
+    else:
+        from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+
+        model_path = download_weights_from_hf_specific(model_name, None, ["*"])
+
+    vae_config_path = os.path.join(model_path, "vae/config.json")
+    if not os.path.exists(vae_config_path):
+        raise FileNotFoundError(
+            f"VAE config not found at {vae_config_path}. "
+            "Please ensure the model path contains a valid VAE configuration."
+        )
+    with open(vae_config_path) as f:
+        vae_config = json.load(f)
+        vae_scale_factor = 2 ** (len(vae_config["block_out_channels"]) - 1) if "block_out_channels" in vae_config else 8
+
+    image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
+
+    def post_process_func(images: torch.Tensor | dict[str, Any]) -> list[PIL.Image.Image] | dict[str, Any]:
+        if isinstance(images, dict) and isinstance(images.get("payload"), dict):
+            payload = dict(images["payload"])
+            if "image" not in payload:
+                raise ValueError("FLUX Kontext output envelope requires payload['image']")
+            payload["image"] = image_processor.postprocess(payload["image"])
+            return {"payload": payload, "metadata": images.get("metadata") or {}}
+        result = image_processor.postprocess(images)
+        return result
+
+    return post_process_func
+
+
+class FluxKontextPipeline(
+    nn.Module,
+    FluxPipelineMixin,
+    CFGParallelMixin,
+    SupportImageInput,
+    ProgressBarMixin,
+    DiffusionPipelineProfilerMixin,
+    SupportsComponentDiscovery,
+):
+    """FLUX.1-Kontext pipeline for image editing with text guidance."""
+
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder", "text_encoder_2"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+
+    support_image_input = True
+
+    def __init__(
+        self,
+        *,
+        od_config: OmniDiffusionConfig,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.od_config = od_config
+        self.weights_sources = [
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
+                subfolder="transformer",
+                revision=None,
+                prefix="transformer.",
+                fall_back_to_pt=True,
+            )
+        ]
+
+        self._execution_device = get_local_device()
+        model = od_config.model
+        local_files_only = os.path.exists(model)
+
+        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+            model,
+            subfolder="scheduler",
+            local_files_only=local_files_only,
+        )
+
+        self.text_encoder = CLIPTextModel.from_pretrained(
+            model,
+            subfolder="text_encoder",
+            local_files_only=local_files_only,
+        ).to(self._execution_device)
+
+        self.text_encoder_2 = T5EncoderModel.from_pretrained(
+            model,
+            subfolder="text_encoder_2",
+            local_files_only=local_files_only,
+        ).to(self._execution_device)
+
+        self.tokenizer = CLIPTokenizer.from_pretrained(
+            model,
+            subfolder="tokenizer",
+            local_files_only=local_files_only,
+        )
+        self.tokenizer_2 = T5TokenizerFast.from_pretrained(
+            model,
+            subfolder="tokenizer_2",
+            local_files_only=local_files_only,
+        )
+
+        self.vae = AutoencoderKL.from_pretrained(
+            model,
+            subfolder="vae",
+            local_files_only=local_files_only,
+        ).to(self._execution_device)
+
+        transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, FluxKontextTransformer2DModel)
+        transformer_kwargs["od_config"] = od_config
+        transformer_kwargs["quant_config"] = od_config.quantization_config
+        self.transformer = FluxKontextTransformer2DModel(**transformer_kwargs)
+
+        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
+        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
+        self.tokenizer_max_length = (
+            self.tokenizer.model_max_length if hasattr(self, "tokenizer") and self.tokenizer is not None else 77
+        )
+        self.default_sample_size = 128
+        self._guidance_scale = None
+        self._attention_kwargs = None
+        self._joint_attention_kwargs = None
+        self._num_timesteps = None
+        self._current_timestep = None
+        self._interrupt = False
+        self._callback_tensor_inputs = ["latents", "prompt_embeds"]
+        self.latent_channels = self.vae.config.latent_channels if hasattr(self.vae, "config") else 16
+
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
+
+    def _get_t5_prompt_embeds(
+        self,
+        prompt: str | list[str] = None,
+        num_images_per_prompt: int = 1,
+        max_sequence_length: int = 512,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ):
+        device = device or self._execution_device
+        dtype = dtype or self.text_encoder.dtype
+
+        prompt = [prompt] if isinstance(prompt, str) else prompt
+        batch_size = len(prompt)
+
+        if isinstance(self, TextualInversionLoaderMixin):
+            prompt = self.maybe_convert_prompt(prompt, self.tokenizer_2)
+
+        text_inputs = self.tokenizer_2(
+            prompt,
+            padding="max_length",
+            max_length=max_sequence_length,
+            truncation=True,
+            return_length=False,
+            return_overflowing_tokens=False,
+            return_tensors="pt",
+        )
+        text_input_ids = text_inputs.input_ids
+        untruncated_ids = self.tokenizer_2(prompt, padding="longest", return_tensors="pt").input_ids
+
+        if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
+            removed_text = self.tokenizer_2.batch_decode(untruncated_ids[:, self.tokenizer_max_length - 1 : -1])
+            logger.warning(
+                "The following part of your input was truncated because `max_sequence_length` is set to "
+                f" {max_sequence_length} tokens: {removed_text}"
+            )
+
+        prompt_embeds = self.text_encoder_2(text_input_ids.to(device), output_hidden_states=False)[0]
+
+        dtype = self.text_encoder_2.dtype
+        prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
+
+        _, seq_len, _ = prompt_embeds.shape
+
+        prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
+        prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+
+        return prompt_embeds
+
+    def _get_clip_prompt_embeds(
+        self,
+        prompt: str | list[str],
+        num_images_per_prompt: int = 1,
+        device: torch.device | None = None,
+    ):
+        device = device or self._execution_device
+
+        prompt = [prompt] if isinstance(prompt, str) else prompt
+        batch_size = len(prompt)
+
+        if isinstance(self, TextualInversionLoaderMixin):
+            prompt = self.maybe_convert_prompt(prompt, self.tokenizer)
+
+        text_inputs = self.tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=self.tokenizer_max_length,
+            truncation=True,
+            return_overflowing_tokens=False,
+            return_length=False,
+            return_tensors="pt",
+        )
+
+        text_input_ids = text_inputs.input_ids
+        untruncated_ids = self.tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
+        if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
+            removed_text = self.tokenizer.batch_decode(untruncated_ids[:, self.tokenizer_max_length - 1 : -1])
+            logger.warning(
+                "The following part of your input was truncated because CLIP can only handle sequences up to"
+                f" {self.tokenizer_max_length} tokens: {removed_text}"
+            )
+        prompt_embeds = self.text_encoder(text_input_ids.to(device), output_hidden_states=False)
+
+        prompt_embeds = prompt_embeds.pooler_output
+        prompt_embeds = prompt_embeds.to(dtype=self.text_encoder.dtype, device=device)
+
+        prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt)
+        prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, -1)
+
+        return prompt_embeds
+
+    def encode_prompt(
+        self,
+        prompt: str | list[str],
+        prompt_2: str | list[str] | None = None,
+        device: torch.device | None = None,
+        num_images_per_prompt: int = 1,
+        prompt_embeds: torch.FloatTensor | None = None,
+        pooled_prompt_embeds: torch.FloatTensor | None = None,
+        max_sequence_length: int = 512,
+    ):
+        device = device or self._execution_device
+
+        prompt = [prompt] if isinstance(prompt, str) else prompt
+
+        if prompt_embeds is None:
+            prompt_2 = prompt_2 or prompt
+            prompt_2 = [prompt_2] if isinstance(prompt_2, str) else prompt_2
+
+            # We only use the pooled prompt output from the CLIPTextModel
+            pooled_prompt_embeds = self._get_clip_prompt_embeds(
+                prompt=prompt,
+                device=device,
+                num_images_per_prompt=num_images_per_prompt,
+            )
+            prompt_embeds = self._get_t5_prompt_embeds(
+                prompt=prompt_2,
+                num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length,
+                device=device,
+            )
+
+        dtype = self.text_encoder.dtype if self.text_encoder is not None else self.transformer.dtype
+        text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(device=device, dtype=dtype)
+
+        return prompt_embeds, pooled_prompt_embeds, text_ids
+
+    def check_inputs(
+        self,
+        prompt,
+        prompt_2=None,
+        height=None,
+        width=None,
+        negative_prompt=None,
+        negative_prompt_2=None,
+        prompt_embeds=None,
+        pooled_prompt_embeds=None,
+        negative_prompt_embeds=None,
+        negative_pooled_prompt_embeds=None,
+        callback_on_step_end_tensor_inputs=None,
+        max_sequence_length=None,
+    ):
+        if height is not None and height % (self.vae_scale_factor * 2) != 0:
+            logger.warning(
+                f"`height` and `width` have to be divisible by "
+                f"{self.vae_scale_factor * 2} but are {height} and {width}. "
+                f"Dimensions will be resized accordingly"
+            )
+
+        if callback_on_step_end_tensor_inputs is not None and not all(
+            k in self._callback_tensor_inputs for k in callback_on_step_end_tensor_inputs
+        ):
+            invalid_keys = [k for k in callback_on_step_end_tensor_inputs if k not in self._callback_tensor_inputs]
+            raise ValueError(
+                f"`callback_on_step_end_tensor_inputs` has to be in "
+                f"{self._callback_tensor_inputs}, but found {invalid_keys}"
+            )
+
+        if prompt is not None and prompt_embeds is not None:
+            raise ValueError(
+                f"Cannot forward both `prompt`: {prompt} and `prompt_embeds`: {prompt_embeds}. Please make sure to"
+                " only forward one of the two."
+            )
+        elif prompt_2 is not None and prompt_embeds is not None:
+            raise ValueError(
+                f"Cannot forward both `prompt_2`: {prompt_2} and `prompt_embeds`: {prompt_embeds}. Please make sure to"
+                " only forward one of the two."
+            )
+        elif prompt is None and prompt_embeds is None:
+            raise ValueError(
+                "Provide either `prompt` or `prompt_embeds`. Cannot leave both `prompt` and `prompt_embeds` undefined."
+            )
+        elif prompt is not None and (not isinstance(prompt, str) and not isinstance(prompt, list)):
+            raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
+        elif prompt_2 is not None and (not isinstance(prompt_2, str) and not isinstance(prompt_2, list)):
+            raise ValueError(f"`prompt_2` has to be of type `str` or `list` but is {type(prompt_2)}")
+
+        if negative_prompt is not None and negative_prompt_embeds is not None:
+            raise ValueError(
+                f"Cannot forward both `negative_prompt`: {negative_prompt} and `negative_prompt_embeds`:"
+                f" {negative_prompt_embeds}. Please make sure to only forward one of the two."
+            )
+        elif negative_prompt_2 is not None and negative_prompt_embeds is not None:
+            raise ValueError(
+                f"Cannot forward both `negative_prompt_2`: {negative_prompt_2} and `negative_prompt_embeds`:"
+                f" {negative_prompt_embeds}. Please make sure to only forward one of the two."
+            )
+
+        if prompt_embeds is not None and pooled_prompt_embeds is None:
+            raise ValueError(
+                "If `prompt_embeds` are provided, `pooled_prompt_embeds` also have to be passed. "
+                "Make sure to generate `pooled_prompt_embeds` from the same text encoder "
+                "that was used to generate `prompt_embeds`."
+            )
+        if negative_prompt_embeds is not None and negative_pooled_prompt_embeds is None:
+            raise ValueError(
+                "If `negative_prompt_embeds` are provided, `negative_pooled_prompt_embeds` "
+                "also have to be passed. Make sure to generate `negative_pooled_prompt_embeds` "
+                "from the same text encoder that was used to generate `negative_prompt_embeds`."
+            )
+
+        if max_sequence_length is not None and max_sequence_length > 512:
+            raise ValueError(f"`max_sequence_length` cannot be greater than 512 but is {max_sequence_length}")
+
+    def _encode_vae_image(self, image: torch.Tensor, generator: torch.Generator):
+        if image.ndim != 4:
+            raise ValueError(f"Expected image dims 4, got {image.ndim}.")
+
+        if isinstance(generator, list):
+            image_latents = [
+                self.retrieve_latents(self.vae.encode(image[i : i + 1]), generator=generator[i], sample_mode="argmax")
+                for i in range(image.shape[0])
+            ]
+            image_latents = torch.cat(image_latents, dim=0)
+        else:
+            image_latents = self.retrieve_latents(self.vae.encode(image), generator=generator, sample_mode="argmax")
+
+        image_latents = (image_latents - self.vae.config.shift_factor) * self.vae.config.scaling_factor
+
+        if image_latents.ndim == 5:
+            logger.warning("VAE output has 5 dimensions, squeezing first dimension")
+            image_latents = image_latents.squeeze(0)
+
+        return image_latents
+
+    def prepare_latents(
+        self,
+        image: torch.Tensor | None,
+        batch_size: int,
+        num_channels_latents: int,
+        height: int,
+        width: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        latents: torch.Tensor | None = None,
+        reference_state=None,
+    ):
+        if isinstance(generator, list) and len(generator) != batch_size:
+            raise ValueError(
+                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
+                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+            )
+
+        height = 2 * (int(height) // (self.vae_scale_factor * 2))
+        width = 2 * (int(width) // (self.vae_scale_factor * 2))
+        shape = (batch_size, num_channels_latents, height, width)
+
+        image_latents, image_ids = reference_state if reference_state is not None else (None, None)
+        if image is not None and reference_state is None:
+            image = image.to(device=device, dtype=dtype)
+            if image.shape[1] != self.latent_channels:
+                image_latents = self._encode_vae_image(image=image, generator=generator)
+            else:
+                image_latents = image
+            if batch_size > image_latents.shape[0] and batch_size % image_latents.shape[0] == 0:
+                # expand init_latents for batch_size
+                additional_image_per_prompt = batch_size // image_latents.shape[0]
+                image_latents = torch.cat([image_latents] * additional_image_per_prompt, dim=0)
+            elif batch_size > image_latents.shape[0] and batch_size % image_latents.shape[0] != 0:
+                raise ValueError(
+                    f"Cannot duplicate `image` of batch size {image_latents.shape[0]} to {batch_size} text prompts."
+                )
+            else:
+                image_latents = torch.cat([image_latents], dim=0)
+
+            image_latent_height, image_latent_width = image_latents.shape[2:]
+            image_latents = self._pack_latents(
+                image_latents, batch_size, num_channels_latents, image_latent_height, image_latent_width
+            )
+            image_ids = self._prepare_latent_image_ids(image_latent_height // 2, image_latent_width // 2, device, dtype)
+            # image ids are the same as latent ids with the first dimension set to 1 instead of 0
+            image_ids[..., 0] = 1
+
+        latent_ids = self._prepare_latent_image_ids(height // 2, width // 2, device, dtype)
+        validate_kontext_generated_latents(
+            latents,
+            batch_size=batch_size,
+            num_channels_latents=num_channels_latents,
+            latent_height=height,
+            latent_width=width,
+            generated_id_count=latent_ids.shape[0],
+        )
+
+        if latents is None:
+            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            latents = self._pack_latents(latents, batch_size, num_channels_latents, height, width)
+        else:
+            latents = latents.to(device=device, dtype=dtype)
+            if latents.dim() == 4:
+                latents = self._pack_latents(latents, batch_size, num_channels_latents, height, width)
+
+        return latents, image_latents, latent_ids, image_ids
+
+    @property
+    def interrupt(self):
+        return self._interrupt
+
+    @property
+    def guidance_scale(self):
+        return self._guidance_scale
+
+    @property
+    def joint_attention_kwargs(self):
+        return self._joint_attention_kwargs
+
+    @property
+    def num_timesteps(self):
+        return self._num_timesteps
+
+    @property
+    def current_timestep(self) -> torch.Tensor | None:
+        return self._current_timestep
+
+    def predict_noise(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        guidance: torch.Tensor | None,
+        pooled_projections: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        txt_ids: torch.Tensor,
+        img_ids: torch.Tensor,
+        joint_attention_kwargs: dict[str, Any] | None,
+        return_dict: bool = False,
+    ) -> torch.Tensor:
+        return self.transformer(
+            hidden_states=hidden_states,
+            timestep=timestep,
+            guidance=guidance,
+            pooled_projections=pooled_projections,
+            encoder_hidden_states=encoder_hidden_states,
+            txt_ids=txt_ids,
+            img_ids=img_ids,
+            joint_attention_kwargs=joint_attention_kwargs,
+            return_dict=return_dict,
+        )[0]
+
+    def diffuse(
+        self,
+        prompt_embeds: torch.Tensor,
+        pooled_prompt_embeds: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor | None,
+        negative_pooled_prompt_embeds: torch.Tensor | None,
+        latents: torch.Tensor,
+        image_latents: torch.Tensor | None,
+        latent_ids: torch.Tensor,
+        text_ids: torch.Tensor,
+        negative_text_ids: torch.Tensor | None,
+        timesteps: torch.Tensor,
+        do_true_cfg: bool,
+        guidance: torch.Tensor | None,
+        true_cfg_scale: float,
+        acceleration_config: FluxKontextAccelerationConfig,
+        height: int,
+        width: int,
+        callback_on_step_end: Callable[[int, int, dict], None] | None = None,
+        callback_on_step_end_tensor_inputs: list[str] = ["latents"],
+    ) -> torch.Tensor:
+        self.transformer.do_true_cfg = do_true_cfg
+        if acceleration_config.uses_custom_transformer_path:
+            return diffuse_with_flux_kontext_acceleration(
+                self,
+                config=acceleration_config,
+                prompt_embeds=prompt_embeds,
+                pooled_prompt_embeds=pooled_prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+                latents=latents,
+                image_latents=image_latents,
+                latent_ids=latent_ids,
+                text_ids=text_ids,
+                negative_text_ids=negative_text_ids,
+                timesteps=timesteps,
+                do_true_cfg=do_true_cfg,
+                guidance=guidance,
+                true_cfg_scale=true_cfg_scale,
+                height=height,
+                width=width,
+                callback_on_step_end=callback_on_step_end,
+                callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+            )
+
+        dense_graphs = None
+        if (acceleration_config.method == "dense" and len(timesteps) == 28
+                and os.environ.get("SPARSEEDIT_TRACK_A_DENSE_GRAPH") == "1"):
+            from .dense_baseline import DenseBaselineGraphs
+
+            if latents.shape[0] != 1 or callback_on_step_end or self.joint_attention_kwargs:
+                raise ValueError("Dense graph scope requires a plain serial batch-one request")
+            dense_graphs = getattr(self, "_track_a_dense_graphs", None)
+            if dense_graphs is None:
+                dense_graphs = self._track_a_dense_graphs = DenseBaselineGraphs()
+            dense_before = dense_graphs.replay_counts()
+
+        self.scheduler.set_begin_index(0)
+        with self.progress_bar(total=len(timesteps)) as pbar:
+            for i, t in enumerate(timesteps):
+                if self.interrupt:
+                    continue
+
+                self._current_timestep = t
+                latent_model_input = latents
+                if image_latents is not None:
+                    latent_model_input = torch.cat([latents, image_latents], dim=1)
+                timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
+
+                positive_kwargs = {
+                    "hidden_states": latent_model_input,
+                    "timestep": timestep / 1000,
+                    "guidance": guidance,
+                    "pooled_projections": pooled_prompt_embeds,
+                    "encoder_hidden_states": prompt_embeds,
+                    "txt_ids": text_ids,
+                    "img_ids": latent_ids,
+                    "joint_attention_kwargs": self.joint_attention_kwargs,
+                    "return_dict": False,
+                }
+                negative_kwargs = None
+                if do_true_cfg:
+                    negative_kwargs = {
+                        "hidden_states": latent_model_input,
+                        "timestep": timestep / 1000,
+                        "guidance": guidance,
+                        "pooled_projections": negative_pooled_prompt_embeds,
+                        "encoder_hidden_states": negative_prompt_embeds,
+                        "txt_ids": negative_text_ids,
+                        "img_ids": latent_ids,
+                        "joint_attention_kwargs": self.joint_attention_kwargs,
+                        "return_dict": False,
+                    }
+
+                if dense_graphs is None:
+                    noise_pred = self.predict_noise_maybe_with_cfg(
+                        do_true_cfg,
+                        true_cfg_scale,
+                        positive_kwargs,
+                        negative_kwargs,
+                        cfg_normalize=False,
+                        output_slice=latents.size(1),
+                    )
+                else:
+                    positive = dense_graphs.forward("positive", self.predict_noise, positive_kwargs)
+                    positive = positive[:, :latents.size(1)]
+                    if do_true_cfg:
+                        negative = dense_graphs.forward("negative", self.predict_noise, negative_kwargs)
+                        noise_pred = self.combine_cfg_noise(
+                            positive, negative[:, :latents.size(1)], true_cfg_scale, cfg_normalize=False,
+                        )
+                    else:
+                        noise_pred = positive
+
+                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+
+                if callback_on_step_end is not None:
+                    callback_kwargs = {}
+                    for k in callback_on_step_end_tensor_inputs:
+                        callback_kwargs[k] = locals()[k]
+                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+
+                    latents = callback_outputs.pop("latents", latents)
+                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+
+                pbar.update()
+        if dense_graphs is not None:
+            self._last_flux_acceleration_metadata = {
+                "method": "dense", "dense_graph": dense_graphs.metadata(dense_before),
+            }
+        return latents
+
+    @torch.no_grad()
+    def forward(
+        self,
+        req: DiffusionRequestBatch,
+        image: PIL.Image.Image | list[PIL.Image.Image] | None = None,
+        prompt: str | list[str] | None = None,
+        prompt_2: str | list[str] | None = None,
+        negative_prompt: str | list[str] | None = None,
+        negative_prompt_2: str | list[str] | None = None,
+        height: int | None = None,
+        width: int | None = None,
+        num_inference_steps: int = 28,
+        guidance_scale: float = 3.5,
+        true_cfg_scale: float = 1.0,
+        num_images_per_prompt: int = 1,
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        latents: torch.Tensor | None = None,
+        prompt_embeds: torch.Tensor | None = None,
+        pooled_prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        negative_pooled_prompt_embeds: torch.Tensor | None = None,
+        output_type: str | None = "pil",
+        return_dict: bool = True,
+        attention_kwargs: dict[str, Any] | None = None,
+        callback_on_step_end: Callable[[int, int, dict], None] | None = None,
+        callback_on_step_end_tensor_inputs: list[str] = ["latents"],
+        max_sequence_length: int = 512,
+        sigmas: list[float] | None = None,
+    ) -> DiffusionOutput:
+        # Handle multiple prompts - only take the first one, similar to Flux2KleinPipeline
+        if len(req.prompts) > 1:
+            logger.warning(
+                "This model only supports a single prompt, not a batched request. Taking only the first prompt for now."
+            )
+        first_prompt = req.prompts[0] if req.prompts else None
+
+        if isinstance(first_prompt, str):
+            prompt = first_prompt
+            # Keep negative_prompt from function parameter (passed via API)
+        elif first_prompt:
+            prompt = first_prompt.get("prompt") or ""
+            # Prefer negative_prompt from prompt dict, fallback to function parameter
+            np_from_dict = first_prompt.get("negative_prompt")
+            if np_from_dict is not None:
+                negative_prompt = np_from_dict
+        # else: keep original prompt unchanged
+
+        # Handle image from prompt data
+        if isinstance(first_prompt, str):
+            raw_image = None
+        elif first_prompt:
+            raw_image = first_prompt.get("multi_modal_data", {}).get("image")
+        else:
+            raw_image = None
+
+        if raw_image is None:
+            pass  # use image from param list
+        elif isinstance(raw_image, list):
+            image = [PIL.Image.open(im) if isinstance(im, str) else cast(PIL.Image.Image, im) for im in raw_image]
+        else:
+            image = PIL.Image.open(raw_image) if isinstance(raw_image, str) else cast(PIL.Image.Image, raw_image)
+        height = req.sampling_params.height or height
+        width = req.sampling_params.width or width
+        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        sigmas = req.sampling_params.sigmas or sigmas
+        guidance_scale = (
+            req.sampling_params.guidance_scale if req.sampling_params.guidance_scale_provided else guidance_scale
+        )
+        num_images_per_prompt = (
+            req.sampling_params.num_outputs_per_prompt
+            if req.sampling_params.num_outputs_per_prompt > 0
+            else num_images_per_prompt
+        )
+        true_cfg_scale = (
+            req.sampling_params.true_cfg_scale if req.sampling_params.true_cfg_scale is not None else true_cfg_scale
+        )
+        generator = req.sampling_params.generator or generator
+        num_images_per_prompt = (
+            req.sampling_params.num_outputs_per_prompt
+            if req.sampling_params.num_outputs_per_prompt > 0
+            else num_images_per_prompt
+        )
+        latents = (
+            req.sampling_params.extra_args.get("latents")
+            if req.sampling_params.extra_args.get("latents") is not None
+            else latents
+        )
+        auto_size_from_reference = height is None and width is None
+        reference_latents = normalize_kontext_reference_latents(image, latent_channels=self.latent_channels)
+        image_is_latent = reference_latents is not None
+        if reference_latents is not None:
+            image = reference_latents
+        image_height = image_width = None
+        if image is not None and not image_is_latent:
+            img = image[0] if isinstance(image, list) else image
+            image_height, image_width = self.image_processor.get_default_height_width(img)
+        height, width = resolve_kontext_dimensions(
+            image_height,
+            image_width,
+            height,
+            width,
+            generated_latents=latents,
+            reference_latents=reference_latents,
+            vae_scale_factor=self.vae_scale_factor,
+        )
+
+        self.check_inputs(
+            prompt,
+            prompt_2=prompt_2,
+            height=height,
+            width=width,
+            negative_prompt=negative_prompt,
+            negative_prompt_2=negative_prompt_2,
+            prompt_embeds=prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+            callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+            max_sequence_length=max_sequence_length,
+        )
+
+        self._guidance_scale = guidance_scale
+        self._attention_kwargs = attention_kwargs
+        self._joint_attention_kwargs = attention_kwargs if attention_kwargs is not None else {}
+        self._interrupt = False
+
+        if prompt is not None and isinstance(prompt, str):
+            batch_size = 1
+        elif prompt is not None and isinstance(prompt, list):
+            batch_size = len(prompt)
+        else:
+            batch_size = prompt_embeds.shape[0]
+
+        device = self._execution_device
+
+        has_neg_prompt = negative_prompt is not None or (
+            negative_prompt_embeds is not None and negative_pooled_prompt_embeds is not None
+        )
+        do_true_cfg = true_cfg_scale > 1.0 and has_neg_prompt
+
+        do_true_cfg = do_true_cfg and self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
+
+        serial_mode = session_mode()
+        use_serial_cache = serial_mode != "off" and num_inference_steps == 28
+        session_witness = {}
+        self._track_a_tail = None
+        if serial_mode == "idle_prewarm":
+            self._track_a_idle_prewarm = None
+        # 1. Prepare text embeddings
+        encode_wall_started = time.perf_counter()
+        formal_memory = device.type == "cuda" and os.environ.get("SPARSEEDIT_TRACK_A_FORMAL_MEMORY") == "1"
+        if formal_memory:
+            torch.cuda.reset_peak_memory_stats(device)
+        track_a_profile = device.type == "cuda" and os.environ.get("SPARSEEDIT_TRACK_A_DEVICE_LEDGER") == "1"
+        if track_a_profile:
+            encoding_start, encoding_end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+            encoding_start.record()
+        prompt_embeds, pooled_prompt_embeds, text_ids = self.encode_prompt(
+            prompt=prompt,
+            prompt_2=prompt_2,
+            device=device,
+            num_images_per_prompt=num_images_per_prompt,
+            prompt_embeds=prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            max_sequence_length=max_sequence_length,
+        )
+
+        if do_true_cfg:
+            def encode_negative():
+                return self.encode_prompt(
+                    prompt=negative_prompt, prompt_2=negative_prompt_2,
+                    prompt_embeds=negative_prompt_embeds, pooled_prompt_embeds=negative_pooled_prompt_embeds,
+                    device=device, num_images_per_prompt=num_images_per_prompt,
+                    max_sequence_length=max_sequence_length,
+                )
+
+            if (use_serial_cache and serial_mode in ("l1_l2", "l1_l2_l3")
+                    and negative_prompt == " " and negative_prompt_2 in (None, " ")
+                    and negative_prompt_embeds is None and negative_pooled_prompt_embeds is None):
+                bank = getattr(self, "_track_a_negative_bank", None)
+                if bank is None:
+                    bank = self._track_a_negative_bank = UniversalNegativeBank()
+                    self._sparseedit_condition_bank = bank.projection_cache
+                values, hit = bank.encode(
+                    (id(self.text_encoder), id(self.text_encoder_2), device, max_sequence_length, num_images_per_prompt),
+                    encode_negative,
+                )
+                session_witness["negative_text_hit"] = hit
+            else:
+                values = encode_negative()
+            negative_prompt_embeds, negative_pooled_prompt_embeds, negative_text_ids = values
+
+        # 2. Process images
+        source_cache = cached_source = source_key = None
+        if (use_serial_cache and serial_mode == "l1_l2_l3"
+                and isinstance(image, PIL.Image.Image) and not image_is_latent):
+            source_cache = getattr(self, "_track_a_source_cache", None)
+            if source_cache is None:
+                source_cache = self._track_a_source_cache = SourceImageSessionCache()
+            source_key = source_cache.key(image, height, width, prompt_embeds.dtype)
+            cached_source = source_cache.get(source_key)
+            session_witness["source_cache_key"] = source_key
+            session_witness["source_image_hit"] = cached_source is not None
+            if cached_source is not None:
+                image = cached_source[0]
+
+        if image is not None and not image_is_latent and cached_source is None:
+            if image_height is None or image_width is None:
+                raise RuntimeError("FLUX Kontext reference image dimensions were not resolved")
+            multiple_of = self.vae_scale_factor * 2
+            if auto_size_from_reference:
+                image_height, image_width = height, width
+            else:
+                image_width = image_width // multiple_of * multiple_of
+                image_height = image_height // multiple_of * multiple_of
+            image = self.image_processor.resize(image, image_height, image_width)
+            image = self.image_processor.preprocess(image, image_height, image_width)
+
+        # 3. Prepare latent variables
+        num_channels_latents = self.transformer.in_channels // 4
+        latents, image_latents, latent_ids, image_ids = self.prepare_latents(
+            image=image,
+            batch_size=batch_size * num_images_per_prompt,
+            num_channels_latents=num_channels_latents,
+            height=height,
+            width=width,
+            dtype=prompt_embeds.dtype,
+            device=device,
+            generator=generator,
+            latents=latents,
+            reference_state=cached_source[1:] if cached_source is not None else None,
+        )
+        if source_cache is not None:
+            if cached_source is None:
+                source_cache.put(source_key, (image, image_latents, image_ids))
+            session_witness["source_cache_entries"] = len(source_cache.entries)
+
+        if image_ids is not None:
+            latent_ids = torch.cat([latent_ids, image_ids], dim=0)
+
+        # 4. Prepare timesteps
+        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
+        if hasattr(self.scheduler.config, "use_flow_sigmas") and self.scheduler.config.use_flow_sigmas:
+            sigmas = None
+        image_seq_len = latents.shape[1]
+        mu = self.calculate_shift(
+            image_seq_len,
+            self.scheduler.config.get("base_image_seq_len", 256),
+            self.scheduler.config.get("max_image_seq_len", 4096),
+            self.scheduler.config.get("base_shift", 0.5),
+            self.scheduler.config.get("max_shift", 1.15),
+        )
+        timesteps, num_inference_steps = self.retrieve_timesteps(
+            self.scheduler,
+            num_inference_steps,
+            device,
+            sigmas=sigmas,
+            mu=mu,
+        )
+        self._num_timesteps = len(timesteps)
+
+        acceleration_config = FluxKontextAccelerationConfig.from_extra_args(
+            req.sampling_params.extra_args,
+            num_inference_steps=len(timesteps),
+        )
+        if acceleration_config.uses_pipeline_cache_backend:
+            configured_backend = getattr(self.od_config, "cache_backend", "none")
+            if configured_backend != acceleration_config.method:
+                raise ValueError(
+                    f"flux_acceleration_method={acceleration_config.method} requires "
+                    f"cache_backend={acceleration_config.method}, got {configured_backend}"
+                )
+        elif acceleration_config.uses_custom_transformer_path:
+            configured_backend = getattr(self.od_config, "cache_backend", "none")
+            if configured_backend not in (None, "", "none"):
+                raise ValueError(
+                    f"flux_acceleration_method={acceleration_config.method} cannot be combined with "
+                    f"cache_backend={configured_backend}"
+                )
+
+        if self.transformer.guidance_embeds:
+            guidance = torch.full([1], guidance_scale, device=device, dtype=torch.float32)
+            guidance = guidance.expand(latents.shape[0])
+        else:
+            guidance = None
+
+        if self.joint_attention_kwargs is None:
+            self._joint_attention_kwargs = {}
+
+        # 5. Denoising loop
+        if track_a_profile:
+            encoding_end.record()
+        ledger = DeviceLedger(lambda: torch.cuda.Event(enable_timing=True)) if track_a_profile else None
+        self._last_flux_stage_timings = {
+            "encoding_wall_seconds": time.perf_counter() - encode_wall_started,
+            "prepared_reference_latents": image_latents is not None,
+        }
+        stage_denoise_started = time.perf_counter()
+        if formal_memory:
+            encode_peak = (torch.cuda.max_memory_allocated(device), torch.cuda.max_memory_reserved(device))
+        self._last_flux_acceleration_metadata = None
+        with ledger if ledger is not None else nullcontext():
+            latents = self.diffuse(
+                prompt_embeds=prompt_embeds,
+                pooled_prompt_embeds=pooled_prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+                latents=latents,
+                image_latents=image_latents,
+                latent_ids=latent_ids,
+                text_ids=text_ids,
+                negative_text_ids=negative_text_ids if do_true_cfg else None,
+                timesteps=timesteps,
+                do_true_cfg=do_true_cfg,
+                guidance=guidance,
+                true_cfg_scale=true_cfg_scale,
+                acceleration_config=acceleration_config,
+                height=height,
+                width=width,
+                callback_on_step_end=callback_on_step_end,
+                callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+            )
+        self._last_flux_stage_timings["denoise_wall_seconds"] = time.perf_counter() - stage_denoise_started
+        if output_type == "latent":
+            image = latents
+        else:
+            decode_started = time.perf_counter()
+            if track_a_profile:
+                decode_start, decode_end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+                decode_start.record()
+            latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
+            latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+            image = self.vae.decode(latents, return_dict=False)[0]
+            self._last_flux_stage_timings["decode_wall_seconds"] = time.perf_counter() - decode_started
+            if track_a_profile:
+                decode_end.record()
+                decode_end.synchronize()
+                copy_seconds, copy_count = ledger.seconds("graph_output_copy")
+                self._last_flux_stage_timings.update(
+                    encoding_s=encoding_start.elapsed_time(encoding_end) / 1000.0,
+                    decode_s=decode_start.elapsed_time(decode_end) / 1000.0,
+                    graph_output_copy_s=copy_seconds,
+                    graph_output_copy_count=copy_count,
+                )
+
+        tail = self._track_a_tail
+        self._track_a_tail = None
+        if tail is not None and serial_mode == "idle_prewarm":
+            self._track_a_idle_prewarm = PostResponsePrewarm(tail)
+            session_witness["post_response_prewarm_ticket"] = self._track_a_idle_prewarm.ticket
+        elif tail is not None:
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="sparseedit-tail") as worker:
+                session_witness["tail"] = worker.submit(tail).result()
+            session_witness["tail"]["boundary"] = "after_VAE_decode_enqueue_before_request_return"
+            session_witness["tail"]["charged_to_request"] = True
+
+        if use_serial_cache and serial_mode == "singleton":
+            from .specialized_template import clear_template
+
+            clear_template(self)
+
+        if acceleration_config.sparseedit_return_metadata:
+            metadata = self._last_flux_acceleration_metadata or {
+                "schema_version": 1,
+                "method": acceleration_config.method,
+                "run_config": acceleration_config.to_metadata(),
+                "summary": {
+                    "transformer_compute_steps": len(timesteps),
+                    "avd_hit_steps": 0,
+                    "dense_steps": len(timesteps),
+                    "sparse_steps": 0,
+                },
+                "step_records": [],
+            }
+            metadata["pipeline_timing"] = dict(getattr(self, "_last_flux_stage_timings", {}) or {})
+            if use_serial_cache:
+                metadata["track_a_session"] = {"mode": serial_mode, **session_witness}
+            if formal_memory:
+                metadata["complete_request_peak_memory"] = {
+                    "max_memory_allocated": max(encode_peak[0], torch.cuda.max_memory_allocated(device)),
+                    "max_memory_reserved": max(encode_peak[1], torch.cuda.max_memory_reserved(device)),
+                    "scope": "worker encoding through VAE decode and pipeline tail",
+                }
+            return DiffusionOutput(output={"payload": {"image": image}, "metadata": {"flux_sparseedit": metadata}})
+        return DiffusionOutput(output=image)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)
